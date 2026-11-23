@@ -499,15 +499,16 @@ __device__ void routingPermutation(KernelParams params,
   int32_t numNonExitingCtas;
   Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
 
+  // DA's fused multi-tile preamble reuses this routing pass as the authoritative per-expert
+  // count producer. Publish once per cluster because every cluster block sees the same count.
+  if (clusterBlockRank == 0 && params.mPtrNumTokensPerExpert != nullptr) {
+    cub::StoreDirectBlocked(threadIdx.x, params.mPtrNumTokensPerExpert, count, params.mNumExperts);
+  }
+
 #pragma unroll
   for (int e = 0; e < ExpertsPerThread; e++) {
     int expert = threadIdx.x * ExpertsPerThread + e;
     if (expert < params.mNumExperts) {
-      // DA's fused multi-tile preamble reuses this routing pass as the authoritative per-expert
-      // count producer. Publish once per cluster because every cluster block sees the same count.
-      if (clusterBlockRank == 0 && params.mPtrNumTokensPerExpert != nullptr) {
-        params.mPtrNumTokensPerExpert[expert] = count[e];
-      }
       // Strided loop to share this work between blocks.
       for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocks) {
         const int32_t localExpertIdx =
@@ -526,19 +527,23 @@ __device__ void routingPermutation(KernelParams params,
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
         initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
-
-      // get the padded offset associated with this expert (token-space, CGA granularity)
-      int32_t offset;
-      if (params.mIsPow2) {
-        offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
-      } else {
-        offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
-      }
-
-      // write expert offsets to shared
-      smemExpertOffset[expert] = offset + blockExpertOffset[e];
     }
   }
+
+  // get the padded offset associated with each expert (token-space, CGA granularity)
+  int32_t expertOffset[ExpertsPerThread];
+#pragma unroll
+  for (int e = 0; e < ExpertsPerThread; e++) {
+    if (params.mIsPow2) {
+      expertOffset[e] = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
+    } else {
+      expertOffset[e] = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
+    }
+    expertOffset[e] += blockExpertOffset[e];
+  }
+
+  // write expert offsets to shared
+  cub::StoreDirectBlocked(threadIdx.x, smemExpertOffset, expertOffset, params.mNumExperts);
 
   // write out padded count
   if (clusterBlockRank == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync()) {
@@ -761,11 +766,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
   // Get total count for each expert this thread handles.
   int32_t count[ExpertsPerThread];
-#pragma unroll
-  for (int e = 0; e < ExpertsPerThread; e++) {
-    int expert = threadIdx.x * ExpertsPerThread + e;
-    count[e] = (expert < params.mNumExperts) ? params.mPtrExpertCounts[expert] : 0;
-  }
+  cub::LoadDirectBlocked(threadIdx.x, params.mPtrExpertCounts, count, params.mNumExperts, 0);
 
   // Compute the runtime config for projections
   // Whether or not an expert is local is taken into account when the histogram is computed
@@ -783,22 +784,19 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   int32_t numNonExitingCtas;
   Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
 
+  // Get the padded offset associated with each expert (token-space, CGA granularity)
+  int32_t expertOffset[ExpertsPerThread];
 #pragma unroll
   for (int e = 0; e < ExpertsPerThread; e++) {
-    int expert = threadIdx.x * ExpertsPerThread + e;
-    if (expert < params.mNumExperts) {
-      // Get the padded offset associated with this expert (token-space, CGA granularity)
-      int32_t offset;
-      if (params.mIsPow2) {
-        offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
-      } else {
-        offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
-      }
-
-      // Write expert offsets to shared
-      smemExpertOffset[expert] = offset;
+    if (params.mIsPow2) {
+      expertOffset[e] = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
+    } else {
+      expertOffset[e] = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
     }
   }
+
+  // Write expert offsets to shared
+  cub::StoreDirectBlocked(threadIdx.x, smemExpertOffset, expertOffset, params.mNumExperts);
 
   // Sync to make expert offsets available to all threads.
   __syncthreads();

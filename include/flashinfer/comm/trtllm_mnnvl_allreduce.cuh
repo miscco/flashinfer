@@ -24,6 +24,8 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cub/block/block_load.cuh>
+#include <cub/block/block_store.cuh>
 #include <cuda/std/limits>
 #include <iostream>
 #include <tuple>
@@ -391,6 +393,8 @@ template <typename PackedType, typename T>
 union PackedVec {
   PackedType packed;
   T elements[sizeof(PackedType) / sizeof(T)];
+  // The pack as the items of a thread for the CUB block load and store helpers
+  PackedType packedItems[1];
 
   __device__ PackedVec& operator+=(PackedVec& other) {
 #pragma unroll
@@ -1129,18 +1133,27 @@ __global__ void __launch_bounds__(1024)
   }
 
   cudaTriggerProgrammaticLaunchCompletion();
+  // This block owns the packs of its token from blockPackIdx on, one per thread. Threads past the
+  // end of the token have returned above.
+  int const blockPackIdx = packedIdx - threadIdx.x;
+  int const rowPackOffset = token * (tokenDim / kELTS_PER_THREAD) + blockPackIdx;
   if constexpr (RMSNormFusion) {
     // =============================== Residual ===============================
     PackedVec<PackedType, T> residualIn;
-    residualIn.packed = *reinterpret_cast<PackedType const*>(&params.residualInPtr[threadOffset]);
+    cub::LoadDirectBlocked(
+        threadIdx.x, reinterpret_cast<PackedType const*>(params.residualInPtr) + rowPackOffset,
+        residualIn.packedItems);
     packedAccum += residualIn;
     if (params.prenormedPtr != nullptr) {
-      *reinterpret_cast<PackedType*>(&params.prenormedPtr[threadOffset]) = packedAccum.packed;
+      cub::StoreDirectBlocked(threadIdx.x,
+                              reinterpret_cast<PackedType*>(params.prenormedPtr) + rowPackOffset,
+                              packedAccum.packedItems);
     }
     // =============================== Rmsnorm ================================
     PackedVec<PackedType, T> gamma;
-    gamma.packed =
-        *reinterpret_cast<PackedType const*>(&params.gammaPtr[packedIdx * kELTS_PER_THREAD]);
+    cub::LoadDirectBlocked(threadIdx.x,
+                           reinterpret_cast<PackedType const*>(params.gammaPtr) + blockPackIdx,
+                           gamma.packedItems);
 
     float threadSum = 0.F;
 #pragma unroll
@@ -1175,7 +1188,9 @@ __global__ void __launch_bounds__(1024)
     }
   }
   if (params.outputPtr != nullptr) {
-    reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = packedAccum.packed;
+    cub::StoreDirectBlocked(threadIdx.x,
+                            reinterpret_cast<PackedType*>(params.outputPtr) + rowPackOffset,
+                            packedAccum.packedItems);
   }
   if constexpr (QType == QuantType::kFP8) {
     float invOutputScale = 1.0f / (*params.outputScalePtr);
@@ -1642,25 +1657,36 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   // Residual and gamma staging use normal cp.async groups; residual is consumed first.
   __pipeline_wait_prior(1);
 
+  // Round i of thread r holds pack i * loadStride + r of this block's chunk of the token. Packs
+  // past the end of the token load as zero, which adds nothing to the sum of squares.
+  int const numValidPacks =
+      (static_cast<int>(params.tokenDim) - static_cast<int>(baseTokenOffset)) / kELTS_PER_LOAD;
+  PackedType const zeroPack{};
 #pragma unroll
   for (uint32_t i = 0; i < LoadsPerThread; i++) {
-    uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
-    uint32_t const tokenOffset = baseTokenOffset + chunkOffset;
-    if (tokenOffset < params.tokenDim) {
-      PackedVec<PackedType, T> inp{.packed = loadPacked<PackedType>(&smemInput[chunkOffset])};
-      PackedVec<PackedType, T> res{.packed = loadPacked<PackedType>(&smemResidual[chunkOffset])};
-      PackedVec<PackedType, T> inpPlusRes = inp + res;
-      if (params.prenormedPtr != nullptr) {
-        reinterpret_cast<PackedType*>(
-            &params.prenormedPtr[token * params.tokenDim + tokenOffset])[0] = inpPlusRes.packed;
-      }
+    int const roundPackOffset = i * loadStride;
+    int const roundValidPacks = numValidPacks - roundPackOffset;
+    PackedVec<PackedType, T> inp;
+    PackedVec<PackedType, T> res;
+    cub::LoadDirectBlocked(threadOffset,
+                           reinterpret_cast<PackedType const*>(smemInput) + roundPackOffset,
+                           inp.packedItems, roundValidPacks, zeroPack);
+    cub::LoadDirectBlocked(threadOffset,
+                           reinterpret_cast<PackedType const*>(smemResidual) + roundPackOffset,
+                           res.packedItems, roundValidPacks, zeroPack);
+    PackedVec<PackedType, T> inpPlusRes = inp + res;
+    if (params.prenormedPtr != nullptr) {
+      auto* prenormedPacks = reinterpret_cast<PackedType*>(
+          &params.prenormedPtr[token * params.tokenDim + baseTokenOffset]);
+      cub::StoreDirectBlocked(threadOffset, prenormedPacks + roundPackOffset,
+                              inpPlusRes.packedItems, roundValidPacks);
+    }
 
 #pragma unroll
-      for (int j = 0; j < kELTS_PER_LOAD; j++) {
-        float const value = toFloat<T>(inpPlusRes.elements[j]);
-        rInput[i * kELTS_PER_LOAD + j] = value;
-        threadSum += value * value;
-      }
+    for (int j = 0; j < kELTS_PER_LOAD; j++) {
+      float const value = toFloat<T>(inpPlusRes.elements[j]);
+      rInput[i * kELTS_PER_LOAD + j] = value;
+      threadSum += value * value;
     }
   }
 
