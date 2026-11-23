@@ -30,6 +30,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "../coop.cuh"
 #include "../exception.h"
 #include "../fp4_layout.cuh"
 #include "../logging.h"
@@ -1129,18 +1130,25 @@ __global__ void __launch_bounds__(1024)
   }
 
   cudaTriggerProgrammaticLaunchCompletion();
+  // This block owns the elements of its token from blockTokenOffset on, kELTS_PER_THREAD per
+  // thread. Threads past the end of the token have returned above.
+  auto const block = coop::thisBlock();
+  int const blockTokenOffset = (packedIdx - threadIdx.x) * kELTS_PER_THREAD;
+  int const rowOffset = token * tokenDim + blockTokenOffset;
   if constexpr (RMSNormFusion) {
     // =============================== Residual ===============================
     PackedVec<PackedType, T> residualIn;
-    residualIn.packed = *reinterpret_cast<PackedType const*>(&params.residualInPtr[threadOffset]);
+    coop::load(block, coop::blocked, params.residualInPtr + rowOffset, residualIn.elements,
+               coop::vector_aligned);
     packedAccum += residualIn;
     if (params.prenormedPtr != nullptr) {
-      *reinterpret_cast<PackedType*>(&params.prenormedPtr[threadOffset]) = packedAccum.packed;
+      coop::store(block, coop::blocked, params.prenormedPtr + rowOffset, packedAccum.elements,
+                  coop::vector_aligned);
     }
     // =============================== Rmsnorm ================================
     PackedVec<PackedType, T> gamma;
-    gamma.packed =
-        *reinterpret_cast<PackedType const*>(&params.gammaPtr[packedIdx * kELTS_PER_THREAD]);
+    coop::load(block, coop::blocked, params.gammaPtr + blockTokenOffset, gamma.elements,
+               coop::vector_aligned);
 
     float threadSum = 0.F;
 #pragma unroll
@@ -1175,7 +1183,8 @@ __global__ void __launch_bounds__(1024)
     }
   }
   if (params.outputPtr != nullptr) {
-    reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = packedAccum.packed;
+    coop::store(block, coop::blocked, params.outputPtr + rowOffset, packedAccum.elements,
+                coop::vector_aligned);
   }
   if constexpr (QType == QuantType::kFP8) {
     float invOutputScale = 1.0f / (*params.outputScalePtr);
@@ -1642,26 +1651,39 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   // Residual and gamma staging use normal cp.async groups; residual is consumed first.
   __pipeline_wait_prior(1);
 
+  // Pack i of thread r is pack i * loadStride + r of this block's chunk of the token, the striped
+  // arrangement of the block. Packs past the end of the token load as zero, which adds nothing to
+  // the sum of squares.
+  auto const block = coop::thisBlock();
+  int const numValidPacks =
+      (static_cast<int>(params.tokenDim) - static_cast<int>(baseTokenOffset)) / kELTS_PER_LOAD;
+  PackedType inpPacks[LoadsPerThread];
+  PackedType resPacks[LoadsPerThread];
+  coop::load(block, coop::striped, reinterpret_cast<PackedType const*>(smemInput), inpPacks,
+             numValidPacks, PackedType{});
+  coop::load(block, coop::striped, reinterpret_cast<PackedType const*>(smemResidual), resPacks,
+             numValidPacks, PackedType{});
+
+  PackedType inpPlusResPacks[LoadsPerThread];
 #pragma unroll
   for (uint32_t i = 0; i < LoadsPerThread; i++) {
-    uint32_t const chunkOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
-    uint32_t const tokenOffset = baseTokenOffset + chunkOffset;
-    if (tokenOffset < params.tokenDim) {
-      PackedVec<PackedType, T> inp{.packed = loadPacked<PackedType>(&smemInput[chunkOffset])};
-      PackedVec<PackedType, T> res{.packed = loadPacked<PackedType>(&smemResidual[chunkOffset])};
-      PackedVec<PackedType, T> inpPlusRes = inp + res;
-      if (params.prenormedPtr != nullptr) {
-        reinterpret_cast<PackedType*>(
-            &params.prenormedPtr[token * params.tokenDim + tokenOffset])[0] = inpPlusRes.packed;
-      }
+    PackedVec<PackedType, T> inp{.packed = inpPacks[i]};
+    PackedVec<PackedType, T> res{.packed = resPacks[i]};
+    PackedVec<PackedType, T> inpPlusRes = inp + res;
+    inpPlusResPacks[i] = inpPlusRes.packed;
 
 #pragma unroll
-      for (int j = 0; j < kELTS_PER_LOAD; j++) {
-        float const value = toFloat<T>(inpPlusRes.elements[j]);
-        rInput[i * kELTS_PER_LOAD + j] = value;
-        threadSum += value * value;
-      }
+    for (int j = 0; j < kELTS_PER_LOAD; j++) {
+      float const value = toFloat<T>(inpPlusRes.elements[j]);
+      rInput[i * kELTS_PER_LOAD + j] = value;
+      threadSum += value * value;
     }
+  }
+  if (params.prenormedPtr != nullptr) {
+    coop::store(block, coop::striped,
+                reinterpret_cast<PackedType*>(
+                    &params.prenormedPtr[token * params.tokenDim + baseTokenOffset]),
+                inpPlusResPacks, numValidPacks);
   }
 
   __pipeline_wait_prior(0);

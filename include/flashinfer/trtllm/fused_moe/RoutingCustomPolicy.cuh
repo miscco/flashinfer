@@ -647,12 +647,10 @@ struct TopKExpertSelect {
     DataType score[VecSize];
     int32_t idx[VecSize];
 
+    coop::load(coop::thisWarp(), coop::striped, ptrScores, score, numExperts, minScore);
+#pragma unroll
     for (int i = 0; i < VecSize; i++) {
-      auto expertIdx = i * WarpSize + laneIdx;
-      auto newScore =
-          expertIdx < numExperts ? static_cast<DataType>(ptrScores[expertIdx]) : minScore;
-      score[i] = newScore;
-      idx[i] = expertIdx;
+      idx[i] = i * WarpSize + laneIdx;
     }
 
     // Apply preprocess (e.g. softmax over all scores, sigmoid + bias, ...)
@@ -687,11 +685,10 @@ struct TopKExpertSelect {
     DataType score[VecSize];
     int32_t idx[VecSize];
 
+    coop::load(coop::thisWarp(), coop::striped, ptrScores, score, numExperts, minScore);
 #pragma unroll
     for (int i = 0; i < VecSize; ++i) {
-      int32_t const expertIdx = i * WarpSize + laneIdx;
-      score[i] = expertIdx < numExperts ? static_cast<DataType>(ptrScores[expertIdx]) : minScore;
-      idx[i] = expertIdx;
+      idx[i] = i * WarpSize + laneIdx;
     }
 
     PreprocessPolicy_::apply(warp, score, idx, numExperts,

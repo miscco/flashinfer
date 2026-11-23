@@ -337,6 +337,8 @@ def build_common_cflags(
     common_cflags = []
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         common_cflags.append("-DPy_LIMITED_API=0x03090000")
+    # cuda::experimental::coop requires this before the first CCCL header.
+    common_cflags.append("-D_CUDAX_ENABLE_GROUP_FEATURES_IN_LIBCUDACXX")
     common_cflags += _get_glibcxx_abi_build_flags()
     cuda_include_overlay = get_cuda_include_overlay(cuda_home)
     if cuda_include_overlay is not None:

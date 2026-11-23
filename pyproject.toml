@@ -209,7 +209,7 @@ exclude = [
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
-"flashinfer.data.cccl" = ["cub/cub/**", "libcudacxx/include/**", "thrust/thrust/**"]
+"flashinfer.data.cccl" = ["cub/cub/**", "cudax/include/**", "libcudacxx/include/**", "thrust/thrust/**"]
 # EP backend shared libraries built in-tree from 3rdparty/nixl by default
 # during `pip install` (opt out with BUILD_NIXL_EP=0). The .so files live under
 # flashinfer/moe_ep/backends/split/comm/{nccl,nixl}_ep/_libs/ (gitignored;

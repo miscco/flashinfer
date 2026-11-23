@@ -26,6 +26,7 @@
 #include <cuda/std/functional>
 #include <cuda/std/type_traits>
 
+#include "flashinfer/coop.cuh"
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/utils.cuh"
@@ -1095,6 +1096,7 @@ namespace finalize {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace coop = flashinfer::coop;
 namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1343,23 +1345,33 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   }
 #endif
 
-  bool hasLocalExpert = false;
-  for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
-       kChunkIdx += blockDim.x) {
-    int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
-    auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(
-        params.expandedIdxToPermutedIdx)[expandedIdx / TopKUnrollFactor];
-    auto scalePacked = useScale ? reinterpret_cast<ScalePackedType const*>(
-                                      params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
-                                : ScalePackedType{TypeExpW(1.f)};
+  // A single round of FINALIZE_THREADS_PER_BLOCK threads stages the packs of every token.
+  static_assert(MaxTopK / TopKUnrollFactor <= FINALIZE_THREADS_PER_BLOCK);
+  int const numChunks = params.topK / TopKUnrollFactor;
+  int64_t const tokenChunkOffset = tokenIdx * numChunks;
 
-    scaleArrSmem[kChunkIdx] = scalePacked;
-    permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
-    auto const permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxPacked);
+  // Threads without a pack see no local expert.
+  IdxArrayType noLocalExpert;
+  noLocalExpert.fill(-1);
+  IdxPackedType permutedIdxPacked[1];
+  coop::load(
+      coop::thisBlock(), coop::blocked,
+      reinterpret_cast<IdxPackedType const*>(params.expandedIdxToPermutedIdx) + tokenChunkOffset,
+      permutedIdxPacked, numChunks, *reinterpret_cast<IdxPackedType const*>(&noLocalExpert));
+  coop::store(coop::thisBlock(), coop::blocked, permutedIdxArrSmem, permutedIdxPacked, numChunks);
+  if (useScale) {
+    ScalePackedType scalePacked[1];
+    coop::load(coop::thisBlock(), coop::blocked,
+               reinterpret_cast<ScalePackedType const*>(params.expertWeightsPtr) + tokenChunkOffset,
+               scalePacked, numChunks);
+    coop::store(coop::thisBlock(), coop::blocked, scaleArrSmem, scalePacked, numChunks);
+  }
+
+  bool hasLocalExpert = false;
+  auto const permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxPacked[0]);
 #pragma unroll
-    for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
-      hasLocalExpert = hasLocalExpert || permutedIdxArr[ki] != -1;
-    }
+  for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+    hasLocalExpert = hasLocalExpert || permutedIdxArr[ki] != -1;
   }
   // writesTokenRow from the expanded indices read above, each thread holding some of the chunks.
   bool const writeRow = params.zeroRowsWithoutLocalExpert || __syncthreads_or(hasLocalExpert);

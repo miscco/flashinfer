@@ -1275,6 +1275,7 @@ _THIRD_PARTY_KEEP = (
     "flashinfer/data/cutlass/tools/util/include/",
     "flashinfer/data/spdlog/include/",
     "flashinfer/data/cccl/cub/cub/",
+    "flashinfer/data/cccl/cudax/include/",
     "flashinfer/data/cccl/libcudacxx/include/",
     "flashinfer/data/cccl/thrust/thrust/",
 )

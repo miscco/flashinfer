@@ -1332,12 +1332,12 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
       if (warpIdx < LaneTopKNumWorkerWarps) {
         BaseType localScores[LaneTopKValuesPerWorkerLane];
         int32_t localIdx[LaneTopKValuesPerWorkerLane];
+        int const warpExpertOffset = warpIdx * LaneTopKExpertsPerWorkerWarp;
+        coop::load(coop::thisWarp(), coop::striped, smemBiased + warpExpertOffset, localScores,
+                   params.mNumExperts - warpExpertOffset, BaseType{invalidScoreFloat});
 #pragma unroll
         for (int ii = 0; ii < LaneTopKValuesPerWorkerLane; ++ii) {
-          int const expertIdx = warpIdx * LaneTopKExpertsPerWorkerWarp + ii * WarpSize + laneIdx;
-          localIdx[ii] = expertIdx;
-          localScores[ii] =
-              expertIdx < params.mNumExperts ? smemBiased[expertIdx] : BaseType{invalidScoreFloat};
+          localIdx[ii] = warpExpertOffset + ii * WarpSize + laneIdx;
         }
 
         BaseType laneScore;
@@ -1360,14 +1360,10 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
 
       BaseType intermediateScores[LaneTopKMergeValuesPerLane];
       int32_t intermediateExperts[LaneTopKMergeValuesPerLane];
-#pragma unroll
-      for (int ii = 0; ii < LaneTopKMergeValuesPerLane; ++ii) {
-        int const intermediateIdx = ii * WarpSize + laneIdx;
-        bool const valid = intermediateIdx < LaneTopKNumIntermediate;
-        intermediateScores[ii] =
-            valid ? smemIntermediateScores[intermediateIdx] : BaseType{invalidScoreFloat};
-        intermediateExperts[ii] = valid ? smemIntermediateExperts[intermediateIdx] : MaxNumExperts;
-      }
+      coop::load(coop::thisWarp(), coop::striped, smemIntermediateScores, intermediateScores,
+                 LaneTopKNumIntermediate, BaseType{invalidScoreFloat});
+      coop::load(coop::thisWarp(), coop::striped, smemIntermediateExperts, intermediateExperts,
+                 LaneTopKNumIntermediate, MaxNumExperts);
 
       BaseType laneTopKScore;
       int32_t laneTopKExpertIdx;
@@ -1402,11 +1398,11 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
 
     BaseType localScores[NumChunks];
     int32_t localIdx[NumChunks];
+    coop::load(coop::thisWarp(), coop::striped, smemBiased, localScores, params.mNumExperts,
+               BaseType{invalidScoreFloat});
 #pragma unroll
     for (int ii = 0; ii < NumChunks; ++ii) {
-      int const eIdx = ii * WarpSize + laneIdx;
-      localIdx[ii] = eIdx;
-      localScores[ii] = eIdx < params.mNumExperts ? smemBiased[eIdx] : BaseType{invalidScoreFloat};
+      localIdx[ii] = ii * WarpSize + laneIdx;
     }
 
     BaseType topScores[MaxNumTopExperts];
